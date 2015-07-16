@@ -1,0 +1,16 @@
+{application, 'mynameis',
+ [{description, "mynameis IRC Bot"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {'mynameis', []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, [mynameis, mynameis_sup, mynameis_bot]},
+
+  {contributors, []},
+  {licenses, [bsd]},
+  {links, []}
+ ]}.
