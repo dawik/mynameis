@@ -1,3 +1,5 @@
+-include_lib("eunit/include/eunit.hrl").
+
 -module(mynameis_bot).
 
 -author("dave@douchedata.com").
@@ -35,7 +37,7 @@ handle_cast(_, State) ->
     {noreply, State}.
 
 handle_info({Transport, Socket, Message}, State) ->
-    case misc:string_match(Message, "PING :") of
+    case match(Message, "PING :") of
         {match,_} when is_list(Message) -> "PING" ++ ServerAddress = Message,
             send(Socket, "PONG" ++ ServerAddress, Transport);
         {match,_} when is_binary(Message) -> 
@@ -87,34 +89,63 @@ extract_user([H|T], Acc) ->
 extract_user(Data) ->
     extract_user(tl(lists:nth(1,Data)),[]).
 
-option_set(Option, State) ->
+
+option_get(Option, State) ->
     lists:member(Option, State#state.options).
 
-generate_response(State, User, Channel, Message) ->
+is_match(Subject, Match) when hd(Subject) == hd(Match) ->
+    is_match(tl(Subject), tl(Match));
+is_match(_, []) ->
+    true;
+is_match(_, _) ->
+    false.
+
+match(Subject, Match, Pos) when hd(Subject) == hd(Match) ->
+    case is_match(Subject, Match) of
+        true -> {match, Pos};
+        false -> match(tl(Subject), Match, Pos + 1)
+    end;
+
+match([], _Match, _Pos)-> nomatch;
+
+match(_Subject, _Match, _Pos) ->
+    match(tl(_Subject), _Match, _Pos + 1). 
+
+match(Subject, Match) when is_binary(Subject) ->
+    match(binary_to_list(Subject), Match, 0);
+
+match(Subject, Match) ->
+    match(Subject, Match, 0). 
+
+generate_response(State, From, To, "\1VERSION\1") when To == State#state.nickname->
+    {mynameis, Desc, Vsn } = lists:keyfind(mynameis, 1, application:which_applications()),
+    [":", State#state.nickname, " NOTICE ", From, " :\1VERSION ", Desc, " ", Vsn," running on Erlang ", erlang:system_info(otp_release), " https://github.com/dawik/mynameis/\1" "\r\n"];
+
+generate_response(State, From, To, Message) when To == State#state.nickname->
+    case option_get(pandora, State) of
+        true ->[":", State#state.nickname, " PRIVMSG ", From, " :", pandora:say(Message, State#state.nickname), "\r\n"];
+        false -> [":", State#state.nickname, " PRIVMSG ", From, " :", Message, "\r\n"]
+    end;
+
+generate_response(State, From, To, Message) ->
     AddressedToBot = State#state.nickname ++ ":",
-    Pandora = option_set(pandora, State),
-    case hd(Message) of
-        AddressedToBot when Pandora == true ->
-            ["PRIVMSG ", Channel, " :", User, ": ", pandora:say(string:join(tl(Message), " ")), "\r\n"];
-        ">"  ->
+    case hd(string:tokens(Message, " ")) of
+        AddressedToBot ->
+            case option_get(pandora, State) of
+                true ->[":", State#state.nickname, " PRIVMSG ", To, " :", From, ": ", pandora:say(Message, State#state.nickname), "\r\n"];
+                false -> [":", State#state.nickname, " PRIVMSG ", To, " :", From, ": ", Message, "\r\n"]
+            end;
+                ">"  ->
             case lists:keyfind(eval, 1, State#state.options) of
-                {eval, User} -> ["PRIVMSG ", Channel, " :", 3, "4", "1", evaluate_expression(string:join(tl(Message), " ")), "\r\n"];
+                {eval, From} -> ["PRIVMSG ", To, " :", 3, "4", "1", evaluate_expression(tl(Message)), "\r\n"];
                 _ -> no_response
             end;
         _ -> 
-            _URLFun = fun(El, Acc) -> 
-                    case misc:string_match(El, "http://") /= nomatch orelse misc:string_match(El, "https://") /= nomatch of
-                    true -> El; 
-                    _ -> Acc 
-                    end 
-            end,
-            case lists:foldl(_URLFun, no_url, Message) of 
-                no_url -> no_response;
-                URL -> 
-                    case utg:get_title(string:strip(URL), nomatch) of
-                        nomatch -> no_response;
-                        Title -> ["PRIVMSG ", Channel, " :", Title , "\r\n"]
-                    end
+            case lists:foldl(fun(El, Acc) -> case match(El, "http://") /= nomatch orelse match(El, "https://") /= nomatch of true -> [El | Acc]; _ -> Acc end end, [], string:tokens(Message, " ")) of 
+                [] -> 
+                    no_response;
+                URLS -> 
+                    [ case utg:grab(URL, nomatch) of nomatch -> no_response; {Title, RTT} -> ["PRIVMSG ", To, " :", Title , " · ", RTT, "s\r\n"] end || URL <- URLS ]
             end
     end.
 
@@ -123,28 +154,28 @@ process_message(Message, State, Transport) when is_binary(Message) ->
 
 process_message(Message, State, Transport) ->
     TokenizedMessage = string:tokens(Message, " "),
-    User = extract_user(TokenizedMessage),
+    From = extract_user(TokenizedMessage),
 
     case lists:nth(2,TokenizedMessage) of
         "PRIVMSG" when length(TokenizedMessage) > 3 ->
-            Channel = lists:nth(3,TokenizedMessage),
-            Trailing = string:tokens(lists:reverse(lists:nthtail(2, lists:reverse(tl(string:join(lists:nthtail(3,TokenizedMessage), " "))))), " "),
-            case generate_response(State, User, Channel, Trailing) of
+            To = lists:nth(3,TokenizedMessage),
+            Trailing = lists:reverse(lists:nthtail(2, lists:reverse(tl(string:join(lists:nthtail(3,TokenizedMessage), " "))))),
+            case generate_response(State, From, To, Trailing) of
                 no_response -> ok;
                 Response -> send(State#state.socket, Response, Transport)
             end,
-            case option_set(logging, State) of
+            case option_get(logging, State) of
                 true -> 
                     {Date, Time} = erlang:universaltime(),
-                    file:write_file(State#state.server ++ "_log", io_lib:fwrite("[~p ~p] ~s <~s> ~s", [Date, Time, Channel, User, tl(string:join(Trailing, " "))]), [append]);
+                    file:write_file(State#state.server ++ "_log", io_lib:fwrite("[~p ~p] ~p <~p> ~p~n", [Date, Time, To, From, Trailing]), [append]);
                 false -> ok
             end;
 
         "JOIN" ->
-            Channel = lists:sublist(lists:nth(3,TokenizedMessage),2,length(lists:nth(3,TokenizedMessage))-3),
-            Op = ["MODE ", Channel, " +o ", User, "\r\n"],
-            Notice = ["NOTICE ", User, " :Welcome to ", Channel, " BE nice.\r\n"],
-            Response = case option_set(autoop, State) of
+            To = lists:sublist(lists:nth(3,TokenizedMessage),2,length(lists:nth(3,TokenizedMessage))-3),
+            Op = ["MODE ", To, " +o ", From, "\r\n"],
+            Notice = ["NOTICE ", From, " :Welcome to ", To, " BE nice.\r\n"],
+            Response = case option_get(autoop, State) of
                 true -> [Op, Notice];
                 false -> [Notice]
             end,
@@ -170,3 +201,7 @@ evaluate_expression(S) ->
                     lists:flatten(io_lib:format("~p", [Error]))
             end
     end.
+
+eunit_test_() ->
+    Integrate = [ {"giving time to connect", {timeout, 180, ?_assertMatch(true, begin timer:sleep(180000), true end)}} ],
+    [{"Connecting to EFnet for integration test", {foreach, fun () -> application:start(mynameis), start_link("testrun", "efnet.port80.se", 6667, ["#mynameistest"], [pandora, url, autoop, {eval, "davve"}, logging]) end, Integrate}}]. 
