@@ -90,9 +90,6 @@ extract_user(Data) ->
     extract_user(tl(lists:nth(1,Data)),[]).
 
 
-option_get(Option, State) ->
-    lists:member(Option, State#state.options).
-
 is_match(Subject, Match) when hd(Subject) == hd(Match) ->
     is_match(tl(Subject), tl(Match));
 is_match(_, []) ->
@@ -122,7 +119,7 @@ generate_response(State, From, To, "\1VERSION\1") when To == State#state.nicknam
     [":", State#state.nickname, " NOTICE ", From, " :\1VERSION ", Desc, " ", Vsn," running on Erlang ", erlang:system_info(otp_release), " https://github.com/dawik/mynameis/\1" "\r\n"];
 
 generate_response(State, From, To, Message) when To == State#state.nickname->
-    case option_get(pandora, State) of
+    case lists:member(pandora, State#state.options) of
         true ->[":", State#state.nickname, " PRIVMSG ", From, " :", pandora:say(Message, State#state.nickname), "\r\n"];
         false -> [":", State#state.nickname, " PRIVMSG ", From, " :", Message, "\r\n"]
     end;
@@ -131,7 +128,7 @@ generate_response(State, From, To, Message) ->
     AddressedToBot = State#state.nickname ++ ":",
     case hd(string:tokens(Message, " ")) of
         AddressedToBot ->
-            case option_get(pandora, State) of
+            case lists:member(pandora, State#state.options) of
                 true ->[":", State#state.nickname, " PRIVMSG ", To, " :", From, ": ", pandora:say(Message, State#state.nickname), "\r\n"];
                 false -> [":", State#state.nickname, " PRIVMSG ", To, " :", From, ": ", Message, "\r\n"]
             end;
@@ -164,7 +161,7 @@ process_message(Message, State, Transport) ->
                 no_response -> ok;
                 Response -> send(State#state.socket, Response, Transport)
             end,
-            case option_get(logging, State) of
+            case lists:member(logging, State#state.options) of
                 true -> 
                     {Date, Time} = erlang:universaltime(),
                     file:write_file(State#state.server ++ "_log", io_lib:fwrite("[~p ~p] ~p <~p> ~p~n", [Date, Time, To, From, Trailing]), [append]);
@@ -175,7 +172,7 @@ process_message(Message, State, Transport) ->
             To = lists:sublist(lists:nth(3,TokenizedMessage),2,length(lists:nth(3,TokenizedMessage))-3),
             Op = ["MODE ", To, " +o ", From, "\r\n"],
             Notice = ["NOTICE ", From, " :Welcome to ", To, " BE nice.\r\n"],
-            Response = case option_get(autoop, State) of
+            Response = case lists:member(autoop, State) of
                 true -> [Op, Notice];
                 false -> [Notice]
             end,
