@@ -56,6 +56,7 @@ handle_info(Message, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
+    timer:sleep(5000),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -112,6 +113,61 @@ set_option({eval, User}, State) when is_list(User) ->
 set_option({eval, User}, State) when is_binary(User) ->
     State#state{eval = User}.
 
+generate_reply(<<"PING", T/binary>>, _State) ->
+    [<<"PONG">>, T];
+
+generate_reply(<<":", T/binary>>, State) ->
+    {SenderBytes, _ } = binary:match(T, <<" ">>),
+    <<Sender:SenderBytes/binary, " ", _Message/binary>> = T,
+    case binary:match(Sender,<<"!">>) of
+        nomatch -> 
+            ok;
+        {NickBytes, _} -> 
+            <<Nick:NickBytes/binary, "!", _T2/binary>> = Sender,
+            {IdBytes, _} = binary:match(_T2, <<"@">>),
+            <<_Ident:IdBytes/binary, "@", _Host/binary>> = _T2,
+            {MsgTypeBytes, _} = binary:match(_Message, <<" ">>),
+            <<MsgType:MsgTypeBytes/binary, " ", _T3/binary>> = _Message,
+            generate_reply(MsgType, _T3, Nick, State)
+    end;
+
+generate_reply(_Bin, _State) ->
+    ok.
+
+generate_reply(<<"\1VERSION\1">>, {Nick, _Channel}, State) ->
+    application:ensure_all_started(mynameis),
+    {mynameis, Desc, Vsn } = lists:keyfind(mynameis, 1, application:which_applications()),
+    [":", State#state.nickname, " NOTICE ", Nick, " :\1VERSION ", Desc, " ", Vsn,
+     " running on Erlang ", erlang:system_info(otp_release), " https://github.com/dawik/mynameis/\1" "\r\n"];
+
+generate_reply(<<"> ", Message/binary>>, {Nick, Channel}, State) when State#state.eval == Nick andalso Channel /= State#state.nickname ->
+    ["PRIVMSG ", Channel, " :", evaluate_expression(binary_to_list(Message))];
+generate_reply(<<"> ", Message/binary>>, {Nick, _}, State) when State#state.eval == Nick ->
+    ["PRIVMSG ", Nick, " :", evaluate_expression(binary_to_list(Message))];
+
+generate_reply(Message, {_, Channel}, State) ->
+    Response = case binary:match(Message, State#state.nickname) of
+        {BotNickBytes, BotNickLen}  when State#state.pandora == true -> 
+            _Bytes = BotNickBytes + BotNickLen,
+            <<_:_Bytes/binary, ": ", Something/binary>> = Message,
+            ["PRIVMSG ", Channel, " :", pandora:say(binary_to_list(Something), binary_to_list(State#state.nickname)), "\r\n"];
+        _ -> []
+    end,
+    Titles = lists:foldl(
+            fun(El, Acc) when length(El) > 8 -> 
+                    case string:equal(string:to_lower(lists:sublist(El, 7)), "http://") 
+                        orelse string:equal(string:to_lower(lists:sublist(El, 8)), "https://") of
+                        true -> 
+                            case utg:grab(El, nomatch) of
+                                nomatch ->Acc;
+                                {Title, ReqTime} -> [Title ++ " " ++ ReqTime ++ "s"|Acc]
+                            end;
+                        false -> Acc
+                    end;
+                (_, Acc) -> Acc 
+            end, [], string:tokens([ X || <<X>> <= Message ], " ")),
+    [Response, "PRIVMSG ", Channel, " :", string:join(lists:reverse(Titles), ", ")].
+
 generate_reply(<<"JOIN">>, T, Nick, State) when Nick /= State#state.nickname ->
     Channel = binary:part(T, {0, byte_size(T) - 2}),
     Op = ["MODE ", Channel, " +o ", Nick, "\r\n"],
@@ -127,54 +183,15 @@ generate_reply(<<"PART">>, _T, _Nick, _State) ->
 generate_reply(<<"MODE">>, _T, _Nick, _State) ->
     ok;
 
-generate_reply(_, T, Nick, State) ->
-    {ChannelOffset, _} = binary:match(T, <<" ">>),
-    <<Channel:ChannelOffset/binary, " :", MessageWithCRNL/binary>> = T,
-    case binary:part(MessageWithCRNL, {0, byte_size(MessageWithCRNL) - 2}) of
-        <<"\1VERSION\1">> ->
-            application:ensure_all_started(mynameis),
-            {mynameis, Desc, Vsn } = lists:keyfind(mynameis, 1, application:which_applications()),
-            [":", State#state.nickname, " NOTICE ", Nick, " :\1VERSION ", Desc, " ", Vsn,
-             " running on Erlang ", erlang:system_info(otp_release), " https://github.com/dawik/mynameis/\1" "\r\n"];
-        <<"> ", ToEval/binary>> when State#state.eval == Nick andalso Channel /= State#state.nickname ->
-            ["PRIVMSG ", Channel, " :", evaluate_expression(binary_to_list(ToEval))];
-        <<"> ", ToEval/binary>> when State#state.eval == Nick ->
-            ["PRIVMSG ", Nick, " :", evaluate_expression(binary_to_list(ToEval))];
-        Message -> 
-            try 
-                case binary:match(Message, State#state.nickname) of
-                    {NickAddressOffset, NickAddressLen} -> 
-                        _Offset = NickAddressOffset + NickAddressLen,
-                        <<_:_Offset/binary, ": ", Something/binary>> = Message,
-                        ["PRIVMSG ", Channel, " :", pandora:say(binary_to_list(Something), binary_to_list(State#state.nickname))]
-                end
-            catch
-                _:_ -> 
-                    ok
-            end
+generate_reply(_, T, Nick, State) when is_binary(T) ->
+    case binary:match(T, <<" ">>) of
+        {ChannelBytes, _} ->
+            <<Channel:ChannelBytes/binary, " :", _T/binary>> = T,
+            MessageNoCRNL = binary:part(_T, {0, byte_size(_T) - 2}),
+            generate_reply(MessageNoCRNL, {Nick, Channel}, State);
+        nomatch ->
+            ok
     end.
-
-generate_reply(<<"PING", T/binary>>, _State) ->
-    [<<"PONG">>, T];
-
-generate_reply(<<":", T/binary>>, State) ->
-    {SenderOffset, _ } = binary:match(T, <<" ">>),
-    <<Sender:SenderOffset/binary, " ", _Message/binary>> = T,
-    case binary:match(Sender,<<"!">>) of
-        nomatch -> 
-            ok;
-        {NickOffset, _} -> 
-            <<Nick:NickOffset/binary, "!", _T2/binary>> = Sender,
-            {IdOffset, _} = binary:match(_T2, <<"@">>),
-            <<_Ident:IdOffset/binary, "@", _Host/binary>> = _T2,
-            {MsgTypeOffset, _} = binary:match(_Message, <<" ">>),
-            <<MsgType:MsgTypeOffset/binary, " ", _T3/binary>> = _Message,
-            generate_reply(MsgType, _T3, Nick, State)
-    end;
-
-generate_reply(Bin, _State) ->
-    io:format("Overflow from last message?~n ***~s***~n", [Bin]),
-    ok.
 
 eunit_test_() ->
     [{"freenode integration test", 
