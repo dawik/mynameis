@@ -10,25 +10,26 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--record(state, {nickname :: binary(), server :: binary(), socket :: port(), options :: list()}).
+-record(state, {nickname :: binary(), server :: binary(), socket :: port(), port :: number(), 
+                transport = tcp, autoop = false, pandora = false, logging = false, url = true, eval = false}).
 
 start_link(Nickname, Server, Port, Channels, Options) ->
     gen_server:start_link({global, Server}, ?MODULE, [Nickname, Server, Port, Channels, Options], []).
 
 init([Nickname, Server, Port, Channels, Options]) ->
-    Transport = case lists:member(ssl, Options) of
-        true -> ssl;
-        false -> tcp
-    end,
-    {ok, Socket} = connect(Server, Port, [binary, {packet, 0}, {keepalive, true}, {active,true}], Transport),
+    State = lists:foldl(fun set_option/2, #state{server = Server, nickname = list_to_binary(Nickname), port = Port}, Options),
+
+    {ok, Socket} = connect(Server, Port, [binary, {packet, 0}, {keepalive, true}, {active,true}], State#state.transport),
+
     spawn(fun() ->
-                send(Socket, [<<"NICK ">>, Nickname, <<"\r\n">>], Transport),
+                send(Socket, [<<"NICK ">>, Nickname, <<"\r\n">>], State#state.transport),
                 timer:sleep(1000),
-                send(Socket, [<<"USER ">>, Nickname, <<" 0 * :">>, Nickname, <<"\r\n">>], Transport),
+                send(Socket, [<<"USER ">>, Nickname, <<" 0 * :">>, Nickname, <<"\r\n">>], State#state.transport),
                 timer:sleep(5000),
-                send(Socket,[ [<<"JOIN ">>, Channel, <<"\r\n">>] || Channel <- Channels], Transport)
+                send(Socket,[ [<<"JOIN ">>, Channel, <<"\r\n">>] || Channel <- Channels], State#state.transport)
         end),
-    {ok, #state{socket = Socket, server = Server, nickname = Nickname, options = Options}}.
+
+    {ok, State#state{socket = Socket}}.
 
 handle_call(_, _, State) ->
     {noreply, State}.
@@ -36,15 +37,10 @@ handle_call(_, _, State) ->
 handle_cast(_, State) ->
     {noreply, State}.
 
-handle_info({Transport, Socket, Message}, State) ->
-    case match(Message, "PING :") of
-        {match,_} when is_list(Message) -> "PING" ++ ServerAddress = Message,
-            send(Socket, "PONG" ++ ServerAddress, Transport);
-        {match,_} when is_binary(Message) -> 
-            <<_Ping:32, ServerAddress/binary>> = Message,
-            send(Socket, [<<"PONG">>, ServerAddress], Transport);
-        nomatch ->
-            process_message(Message, State, Transport)
+handle_info({Transport, _Socket, Message}, State) ->
+    case generate_reply(Message, State) of
+        ok -> ok;
+        Response -> send(State#state.socket, [Response, <<"\r\n">>], Transport)
     end,
     {noreply, State};
 
@@ -77,110 +73,6 @@ connect(Server, Port, Options, ssl) ->
 connect(Server, Port, Options, tcp) ->
     gen_tcp:connect(Server, Port, Options).
 
-extract_user([], Acc) ->
-    lists:reverse(Acc);
-
-extract_user([H|T], Acc) -> 
-    case H of
-        33 -> lists:reverse(Acc); 
-        _ -> extract_user(T, [H|Acc])
-    end.
-
-extract_user(Data) ->
-    extract_user(tl(lists:nth(1,Data)),[]).
-
-
-is_match(Subject, Match) when hd(Subject) == hd(Match) ->
-    is_match(tl(Subject), tl(Match));
-is_match(_, []) ->
-    true;
-is_match(_, _) ->
-    false.
-
-match(Subject, Match, Pos) when hd(Subject) == hd(Match) ->
-    case is_match(Subject, Match) of
-        true -> {match, Pos};
-        false -> match(tl(Subject), Match, Pos + 1)
-    end;
-
-match([], _Match, _Pos)-> nomatch;
-
-match(_Subject, _Match, _Pos) ->
-    match(tl(_Subject), _Match, _Pos + 1). 
-
-match(Subject, Match) when is_binary(Subject) ->
-    match(binary_to_list(Subject), Match, 0);
-
-match(Subject, Match) ->
-    match(Subject, Match, 0). 
-
-generate_response(State, From, To, "\1VERSION\1") when To == State#state.nickname->
-    {mynameis, Desc, Vsn } = lists:keyfind(mynameis, 1, application:which_applications()),
-    [":", State#state.nickname, " NOTICE ", From, " :\1VERSION ", Desc, " ", Vsn," running on Erlang ", erlang:system_info(otp_release), " https://github.com/dawik/mynameis/\1" "\r\n"];
-
-generate_response(State, From, To, Message) when To == State#state.nickname->
-    case lists:member(pandora, State#state.options) of
-        true ->[":", State#state.nickname, " PRIVMSG ", From, " :", pandora:say(Message, State#state.nickname), "\r\n"];
-        false -> [":", State#state.nickname, " PRIVMSG ", From, " :", Message, "\r\n"]
-    end;
-
-generate_response(State, From, To, Message) ->
-    AddressedToBot = State#state.nickname ++ ":",
-    case hd(string:tokens(Message, " ")) of
-        AddressedToBot ->
-            case lists:member(pandora, State#state.options) of
-                true ->[":", State#state.nickname, " PRIVMSG ", To, " :", From, ": ", pandora:say(Message, State#state.nickname), "\r\n"];
-                false -> [":", State#state.nickname, " PRIVMSG ", To, " :", From, ": ", Message, "\r\n"]
-            end;
-                ">"  ->
-            case lists:keyfind(eval, 1, State#state.options) of
-                {eval, From} -> ["PRIVMSG ", To, " :", 3, "4", "1", evaluate_expression(tl(Message)), "\r\n"];
-                _ -> no_response
-            end;
-        _ -> 
-            case lists:foldl(fun(El, Acc) -> case match(El, "http://") /= nomatch orelse match(El, "https://") /= nomatch of true -> [El | Acc]; _ -> Acc end end, [], string:tokens(Message, " ")) of 
-                [] -> 
-                    no_response;
-                URLS -> 
-                    [ case utg:grab(URL, nomatch) of nomatch -> no_response; {Title, RTT} -> ["PRIVMSG ", To, " :", Title , " · ", RTT, "s\r\n"] end || URL <- URLS ]
-            end
-    end.
-
-process_message(Message, State, Transport) when is_binary(Message) ->
-    process_message(binary:bin_to_list(Message), State, Transport);
-
-process_message(Message, State, Transport) ->
-    TokenizedMessage = string:tokens(Message, " "),
-    From = extract_user(TokenizedMessage),
-
-    case lists:nth(2,TokenizedMessage) of
-        "PRIVMSG" when length(TokenizedMessage) > 3 ->
-            To = lists:nth(3,TokenizedMessage),
-            Trailing = lists:reverse(lists:nthtail(2, lists:reverse(tl(string:join(lists:nthtail(3,TokenizedMessage), " "))))),
-            case generate_response(State, From, To, Trailing) of
-                no_response -> ok;
-                Response -> send(State#state.socket, Response, Transport)
-            end,
-            case lists:member(logging, State#state.options) of
-                true -> 
-                    {Date, Time} = erlang:universaltime(),
-                    file:write_file(State#state.server ++ "_log", io_lib:fwrite("[~p ~p] ~p <~p> ~p~n", [Date, Time, To, From, Trailing]), [append]);
-                false -> ok
-            end;
-
-        "JOIN" ->
-            To = lists:sublist(lists:nth(3,TokenizedMessage),2,length(lists:nth(3,TokenizedMessage))-3),
-            Op = ["MODE ", To, " +o ", From, "\r\n"],
-            Notice = ["NOTICE ", From, " :Welcome to ", To, " BE nice.\r\n"],
-            Response = case lists:member(autoop, State) of
-                true -> [Op, Notice];
-                false -> [Notice]
-            end,
-            send(State#state.socket, Response, Transport);
-        _ ->
-            ok
-    end.
-
 evaluate_expression(S) ->
     case erl_scan:string(S) of
         {error, _ } -> ok;
@@ -199,6 +91,93 @@ evaluate_expression(S) ->
             end
     end.
 
+set_option(ssl, State) ->
+    State#state{transport = ssl};
+
+set_option(autoop, State) ->
+    State#state{autoop = true};
+
+set_option(url, State) ->
+    State#state{url = true};
+
+set_option(pandora, State) ->
+    State#state{pandora = true};
+
+set_option(logging, State) ->
+    State#state{logging = true};
+
+set_option({eval, User}, State) when is_list(User) ->
+    State#state{eval = list_to_binary(User)};
+
+set_option({eval, User}, State) when is_binary(User) ->
+    State#state{eval = User}.
+
+generate_reply(<<"JOIN">>, T, Nick, State) when Nick /= State#state.nickname ->
+    Channel = binary:part(T, {0, byte_size(T) - 2}),
+    Op = ["MODE ", Channel, " +o ", Nick, "\r\n"],
+    Notice = ["NOTICE ", Channel, " :Welcome ", Nick, " to ", Channel, "\r\n"],
+    case State#state.autoop of
+        true -> [Op, Notice];
+        false -> [Notice]
+    end;
+
+generate_reply(<<"PART">>, _T, _Nick, _State) ->
+    ok;
+
+generate_reply(<<"MODE">>, _T, _Nick, _State) ->
+    ok;
+
+generate_reply(_, T, Nick, State) ->
+    {ChannelOffset, _} = binary:match(T, <<" ">>),
+    <<Channel:ChannelOffset/binary, " :", MessageWithCRNL/binary>> = T,
+    case binary:part(MessageWithCRNL, {0, byte_size(MessageWithCRNL) - 2}) of
+        <<"\1VERSION\1">> ->
+            application:ensure_all_started(mynameis),
+            {mynameis, Desc, Vsn } = lists:keyfind(mynameis, 1, application:which_applications()),
+            [":", State#state.nickname, " NOTICE ", Nick, " :\1VERSION ", Desc, " ", Vsn,
+             " running on Erlang ", erlang:system_info(otp_release), " https://github.com/dawik/mynameis/\1" "\r\n"];
+        <<"> ", ToEval/binary>> when State#state.eval == Nick andalso Channel /= State#state.nickname ->
+            ["PRIVMSG ", Channel, " :", evaluate_expression(binary_to_list(ToEval))];
+        <<"> ", ToEval/binary>> when State#state.eval == Nick ->
+            ["PRIVMSG ", Nick, " :", evaluate_expression(binary_to_list(ToEval))];
+        Message -> 
+            try 
+                case binary:match(Message, State#state.nickname) of
+                    {NickAddressOffset, NickAddressLen} -> 
+                        _Offset = NickAddressOffset + NickAddressLen,
+                        <<_:_Offset/binary, ": ", Something/binary>> = Message,
+                        ["PRIVMSG ", Channel, " :", pandora:say(binary_to_list(Something), binary_to_list(State#state.nickname))]
+                end
+            catch
+                _:_ -> 
+                    ok
+            end
+    end.
+
+generate_reply(<<"PING", T/binary>>, _State) ->
+    [<<"PONG">>, T];
+
+generate_reply(<<":", T/binary>>, State) ->
+    {SenderOffset, _ } = binary:match(T, <<" ">>),
+    <<Sender:SenderOffset/binary, " ", _Message/binary>> = T,
+    case binary:match(Sender,<<"!">>) of
+        nomatch -> 
+            ok;
+        {NickOffset, _} -> 
+            <<Nick:NickOffset/binary, "!", _T2/binary>> = Sender,
+            {IdOffset, _} = binary:match(_T2, <<"@">>),
+            <<_Ident:IdOffset/binary, "@", _Host/binary>> = _T2,
+            {MsgTypeOffset, _} = binary:match(_Message, <<" ">>),
+            <<MsgType:MsgTypeOffset/binary, " ", _T3/binary>> = _Message,
+            generate_reply(MsgType, _T3, Nick, State)
+    end;
+
+generate_reply(Bin, _State) ->
+    io:format("Overflow from last message?~n ***~s***~n", [Bin]),
+    ok.
+
 eunit_test_() ->
-    Integrate = [ {"giving time to connect", {timeout, 180, ?_assertMatch(true, begin timer:sleep(180000), true end)}} ],
-    [{"Connecting to EFnet for integration test", {foreach, fun () -> application:start(mynameis), start_link("testrun", "efnet.port80.se", 6667, ["#mynameistest"], [pandora, url, autoop, {eval, "davve"}, logging]) end, Integrate}}]. 
+    [{"freenode integration test", 
+      {foreach, 
+       fun()-> application:start(mynameis), start_link("testrun123", "irc.freenode.net", 6667, ["#mynameistest"], [pandora, url, autoop, {eval, "dawik"}, logging]) end, 
+       [ {"giving time to connect", {timeout, 180, ?_assertMatch(true, begin timer:sleep(60000), true end)}} ]}}]. 
