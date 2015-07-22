@@ -1,6 +1,6 @@
 {application, 'mynameis',
  [{description, "mynameis IRC Bot"},
-  {vsn, "0.1.1"},
+  {vsn, "0.1.2"},
   {registered, []},
   {mod, {'mynameis', []}},
   {applications,

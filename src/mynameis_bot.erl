@@ -146,13 +146,14 @@ generate_reply(<<"> ", Message/binary>>, {Nick, _}, State) when State#state.eval
     ["PRIVMSG ", Nick, " :", evaluate_expression(binary_to_list(Message))];
 
 generate_reply(Message, {_, Channel}, State) ->
+    try
     Response = case binary:match(Message, State#state.nickname) of
         {BotNickBytes, BotNickLen}  when State#state.pandora == true -> 
             _Bytes = BotNickBytes + BotNickLen,
             <<_:_Bytes/binary, ": ", Something/binary>> = Message,
             ["PRIVMSG ", Channel, " :", pandora:say(binary_to_list(Something), binary_to_list(State#state.nickname)), "\r\n"];
         _ -> []
-    end,
+        end,
     Titles = lists:foldl(
             fun(El, Acc) when length(El) > 8 -> 
                     case string:equal(string:to_lower(lists:sublist(El, 7)), "http://") 
@@ -166,7 +167,10 @@ generate_reply(Message, {_, Channel}, State) ->
                     end;
                 (_, Acc) -> Acc 
             end, [], string:tokens([ X || <<X>> <= Message ], " ")),
-    [Response, "PRIVMSG ", Channel, " :", string:join(lists:reverse(Titles), ", ")].
+    [Response, "PRIVMSG ", Channel, " :", string:join(lists:reverse(Titles), ", ")]
+    catch
+        error:{badmatch, _} -> ok
+    end.
 
 generate_reply(<<"JOIN">>, T, Nick, State) when Nick /= State#state.nickname ->
     Channel = binary:part(T, {0, byte_size(T) - 2}),
