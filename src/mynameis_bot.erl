@@ -187,6 +187,9 @@ generate_reply(<<"PART">>, _T, _Nick, _State) ->
 generate_reply(<<"MODE">>, _T, _Nick, _State) ->
     ok;
 
+generate_reply(<<"QUIT">>, _T, _Nick, _State) ->
+    ok;
+
 generate_reply(_, T, Nick, State) when is_binary(T) ->
     case binary:match(T, <<" ">>) of
         {ChannelBytes, _} ->
